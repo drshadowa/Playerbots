@@ -124,4 +124,229 @@ public class PlayerBots implements ModInitializer {
                 .then(Commands.literal("list")
                     .executes(ctx -> {
                         for (Bot b : BOTS) {
-                            String line = b.name + " - " + b.mode + ", " + b.m
+                            String line = b.name + " - " + b.mode + ", " + b.mood;
+                            ctx.getSource().sendSuccess(() -> Component.literal(line), false);
+                        }
+                        return BOTS.size();
+                    }))));
+
+        ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) ->
+            onChat(sender, message.signedContent()));
+
+        ServerLivingEntityEvents.AFTER_DAMAGE.register((entity, source, baseDamage, damage, blocked) -> {
+            for (Bot bot : new ArrayList<>(BOTS)) {
+                if (bot.body == entity) onHurt(bot, source);
+            }
+        });
+
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            SERVER = server;
+            tick++;
+            PENDING.removeIf(p -> {
+                if (p.due() <= tick) {
+                    p.run().run();
+                    return true;
+                }
+                return false;
+            });
+            for (Bot bot : new ArrayList<>(BOTS)) tickBot(server, bot);
+        });
+    }
+
+    static Bot find(String name) {
+        for (Bot b : BOTS) if (b.name.equalsIgnoreCase(name)) return b;
+        return null;
+    }
+
+    static double chance(String mood) {
+        return switch (mood) {
+            case "obedient" -> 1.0;
+            case "stubborn" -> 0.35;
+            case "rebel" -> 0.05;
+            default -> 0.75;
+        };
+    }
+
+    static String pick(String[] arr) {
+        return arr[RANDOM.nextInt(arr.length)];
+    }
+
+    static boolean has(String text, String... words) {
+        return Pattern.compile("\\b(" + String.join("|", words) + ")\\b").matcher(text).find();
+    }
+
+    static void say(Bot bot, String text, int delay) {
+        PENDING.add(new Pending(tick + delay, () -> {
+            if (SERVER != null) {
+                SERVER.getPlayerList().broadcastSystemMessage(
+                        Component.literal("<" + bot.name + "> " + text), false);
+            }
+        }));
+    }
+        static void onChat(ServerPlayer sender, String raw) {
+        String text = raw.toLowerCase(Locale.ROOT);
+        for (Bot bot : new ArrayList<>(BOTS)) {
+            if (!text.contains(bot.name.toLowerCase(Locale.ROOT))) continue;
+            boolean obeys = RANDOM.nextDouble() < chance(bot.mood);
+            int delay = 15 + RANDOM.nextInt(30);
+
+            if (has(text, "follow", "come")) {
+                if (obeys) {
+                    bot.mode = "follow";
+                    bot.owner = sender.getUUID();
+                    bot.target = null;
+                    say(bot, pick(OK), delay);
+                } else say(bot, pick(NO), delay);
+            } else if (has(text, "stay", "stop", "wait")) {
+                if (obeys) {
+                    bot.mode = "idle";
+                    bot.target = null;
+                    say(bot, pick(OK), delay);
+                } else say(bot, pick(NO), delay);
+            } else if (has(text, "guard")) {
+                if (obeys) {
+                    bot.mode = "guard";
+                    bot.guardPos = sender.position();
+                    bot.target = null;
+                    say(bot, pick(OK), delay);
+                } else say(bot, pick(NO), delay);
+            } else if (has(text, "fight", "duel", "attack")) {
+                if (obeys) {
+                    bot.mode = "fight";
+                    bot.target = sender;
+                    say(bot, "ok let's go", delay);
+                } else say(bot, pick(NO), delay);
+            } else if (has(text, "hi", "hello", "hey", "yo")) {
+                say(bot, pick(HI), delay);
+            } else {
+                say(bot, pick(CHAT), delay);
+            }
+        }
+    }
+
+    static void onHurt(Bot bot, DamageSource source) {
+        if (!(source.getEntity() instanceof LivingEntity attacker) || attacker == bot.body) return;
+        bot.threat = attacker;
+        if (bot.body.getHealth() < 6.0f && bot.fleeTicks == 0 && RANDOM.nextDouble() < 0.6) {
+            bot.fleeTicks = 100;
+            say(bot, "ok ok I give up!", 5);
+        } else if (!"fight".equals(bot.mode)) {
+            bot.mode = "fight";
+            bot.target = attacker;
+            say(bot, pick(HURT), 8);
+        }
+    }
+
+    static void face(LivingEntity b, double dx, double dz) {
+        float yaw = (float) (Mth.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
+        b.setYRot(yaw);
+        b.setYHeadRot(yaw);
+        b.setYBodyRot(yaw);
+    }
+
+    static double[] toward(LivingEntity b, double tx, double tz, double speed) {
+        double dx = tx - b.getX();
+        double dz = tz - b.getZ();
+        double dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < 0.1) return new double[]{0, 0};
+        face(b, dx, dz);
+        return new double[]{dx / dist * speed, dz / dist * speed};
+    }
+        static double[] combat(Bot bot, ServerLevel level, LivingEntity foe) {
+        LivingEntity b = bot.body;
+        double dx = foe.getX() - b.getX();
+        double dz = foe.getZ() - b.getZ();
+        double dist = Math.max(Math.sqrt(dx * dx + dz * dz), 0.001);
+        face(b, dx, dz);
+        if (dist > 2.7) {
+            return new double[]{dx / dist * 0.2, dz / dist * 0.2};
+        }
+        if (--bot.strafeT <= 0) {
+            bot.strafeDir = RANDOM.nextBoolean() ? 1 : -1;
+            bot.strafeT = 10 + RANDOM.nextInt(20);
+        }
+        if (bot.atkCd <= 0) {
+            bot.atkCd = 14 + RANDOM.nextInt(12);
+            b.swing(InteractionHand.MAIN_HAND);
+            if (RANDOM.nextFloat() < 0.55f) {
+                foe.hurtServer(level, level.damageSources().mobAttack(b), 4.0f);
+                foe.knockback(0.4, b.getX() - foe.getX(), b.getZ() - foe.getZ());
+            }
+        }
+        return new double[]{-dz / dist * 0.12 * bot.strafeDir, dx / dist * 0.12 * bot.strafeDir};
+    }
+
+    static void tickBot(MinecraftServer server, Bot bot) {
+        LivingEntity b = bot.body;
+        if (b.isRemoved() || !b.isAlive()) {
+            BOTS.remove(bot);
+            return;
+        }
+        if (!(b.level() instanceof ServerLevel level)) return;
+        if (bot.atkCd > 0) bot.atkCd--;
+
+        double[] mv = {0, 0};
+
+        if (bot.fleeTicks > 0) {
+            bot.fleeTicks--;
+            if (bot.threat != null && bot.threat.isAlive()) {
+                mv = toward(b, b.getX() * 2 - bot.threat.getX(), b.getZ() * 2 - bot.threat.getZ(), 0.25);
+            }
+            if (bot.fleeTicks == 0) {
+                bot.mode = "idle";
+                bot.target = null;
+            }
+        } else {
+            LivingEntity foe = null;
+            if ("fight".equals(bot.mode)) {
+                foe = bot.target;
+            } else if ("guard".equals(bot.mode)) {
+                double best = Double.MAX_VALUE;
+                for (Monster m : level.getEntitiesOfClass(Monster.class, b.getBoundingBox().inflate(8.0))) {
+                    double d = b.distanceToSqr(m);
+                    if (d < best) {
+                        best = d;
+                        foe = m;
+                    }
+                }
+            }
+            if (foe != null) {
+                boolean bad = !foe.isAlive() || foe.isRemoved() || b.distanceTo(foe) > 30.0f
+                        || (foe instanceof ServerPlayer sp && (sp.isCreative() || sp.isSpectator()));
+                if (bad) {
+                    foe = null;
+                    if ("fight".equals(bot.mode)) {
+                        bot.mode = "idle";
+                        bot.target = null;
+                        say(bot, "gg", 10);
+                    }
+                }
+            }
+            if (foe != null) {
+                mv = combat(bot, level, foe);
+            } else if ("follow".equals(bot.mode) && bot.owner != null) {
+                ServerPlayer owner = server.getPlayerList().getPlayer(bot.owner);
+                if (owner != null && b.distanceTo(owner) > 4.0f) {
+                    mv = toward(b, owner.getX(), owner.getZ(), 0.21);
+                }
+            } else if ("guard".equals(bot.mode) && bot.guardPos != null) {
+                double gx = bot.guardPos.x - b.getX();
+                double gz = bot.guardPos.z - b.getZ();
+                if (gx * gx + gz * gz > 25.0) {
+                    mv = toward(b, bot.guardPos.x, bot.guardPos.z, 0.2);
+                }
+            }
+        }
+
+        boolean moving = mv[0] != 0 || mv[1] != 0;
+        if (b.onGround() && b.horizontalCollision && moving) {
+            bot.vy = 0.42;
+        } else {
+            bot.vy = (bot.vy - 0.08) * 0.98;
+        }
+        b.move(MoverType.SELF, new Vec3(mv[0], bot.vy, mv[1]));
+        if (b.onGround()) bot.vy = 0;
+    }
+}
+
+                    
