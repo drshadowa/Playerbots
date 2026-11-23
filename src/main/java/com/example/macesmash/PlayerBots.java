@@ -468,4 +468,125 @@ public class PlayerBots implements ModInitializer {
             bot.stuckT = 0;
         }
 
+        
         double mx = dx;
+        double mz = dz;
+        if (bot.detourT > 0) {
+            bot.detourT--;
+            mx = -dz * bot.detourSign;
+            mz = dx * bot.detourSign;
+        }
+
+        double[] s = steer(level, b, mx, mz, swimming);
+        boolean walking = s[0] != 0 || s[1] != 0;
+        boolean jump = s[2] > 0.5 || (bot.stuckT > 12 && walking);
+
+        if (swimming) {
+            bot.vy = 0.1;
+        } else if (jump && b.onGround()) {
+            bot.vy = 0.42;
+        } else {
+            bot.vy = (bot.vy - 0.08) * 0.98;
+        }
+        b.move(MoverType.SELF, new Vec3(s[0], bot.vy, s[1]));
+        if (b.onGround()) bot.vy = 0;
+    }
+
+    // ---------- combat (same beginner skill: slow, misses a lot) ----------
+
+    static double[] combat(Bot bot, ServerLevel level, LivingEntity foe) {
+        LivingEntity b = bot.body;
+        double dx = foe.getX() - b.getX();
+        double dz = foe.getZ() - b.getZ();
+        double dist = Math.max(Math.sqrt(dx * dx + dz * dz), 0.001);
+        face(b, dx, dz);
+        if (dist > 2.7) {
+            return new double[]{dx / dist * 0.2, dz / dist * 0.2};
+        }
+        if (--bot.strafeT <= 0) {
+            bot.strafeDir = RANDOM.nextBoolean() ? 1 : -1;
+            bot.strafeT = 10 + RANDOM.nextInt(20);
+        }
+        if (bot.atkCd <= 0 && Math.abs(foe.getY() - b.getY()) < 2.5) {
+            bot.atkCd = 14 + RANDOM.nextInt(12);
+            b.swing(InteractionHand.MAIN_HAND, true);
+            if (RANDOM.nextFloat() < 0.55f) {
+                foe.hurtServer(level, level.damageSources().mobAttack(b), weaponDamage(b.getMainHandItem()));
+                foe.knockback(0.4, b.getX() - foe.getX(), b.getZ() - foe.getZ());
+            }
+        }
+        return new double[]{-dz / dist * 0.12 * bot.strafeDir, dx / dist * 0.12 * bot.strafeDir};
+    }    // ---------- main bot tick ----------
+
+    static void tickBot(MinecraftServer server, Bot bot) {
+        LivingEntity b = bot.body;
+        if (b.isRemoved() || !b.isAlive()) {
+            removeBot(server, bot, false);
+            return;
+        }
+        if (!(b.level() instanceof ServerLevel level)) return;
+        if (bot.atkCd > 0) bot.atkCd--;
+
+        double[] mv = {0, 0};
+
+        if (bot.fleeTicks > 0) {
+            bot.fleeTicks--;
+            if (bot.threat != null && bot.threat.isAlive()) {
+                mv = toward(b, b.getX() * 2 - bot.threat.getX(), b.getZ() * 2 - bot.threat.getZ(), 0.25);
+            }
+            if (bot.fleeTicks == 0) {
+                bot.mode = "idle";
+                bot.target = null;
+            }
+        } else {
+            LivingEntity foe = null;
+            if ("fight".equals(bot.mode)) {
+                foe = bot.target;
+            } else if ("guard".equals(bot.mode)) {
+                double best = Double.MAX_VALUE;
+                for (Monster m : level.getEntitiesOfClass(Monster.class, b.getBoundingBox().inflate(8.0))) {
+                    double d = b.distanceToSqr(m);
+                    if (d < best) {
+                        best = d;
+                        foe = m;
+                    }
+                }
+            }
+            if (foe != null) {
+                boolean bad = !foe.isAlive() || foe.isRemoved() || b.distanceTo(foe) > 30.0f
+                        || (foe instanceof ServerPlayer sp && (sp.isCreative() || sp.isSpectator()));
+                if (bad) {
+                    foe = null;
+                    if ("fight".equals(bot.mode)) {
+                        bot.mode = "idle";
+                        bot.target = null;
+                        say(bot, "gg", 10);
+                    }
+                }
+            }
+            if (foe != null) {
+                mv = combat(bot, level, foe);
+            } else if ("follow".equals(bot.mode) && bot.owner != null) {
+                ServerPlayer owner = server.getPlayerList().getPlayer(bot.owner);
+                if (owner != null && owner.level() == level) {
+                    float dist = b.distanceTo(owner);
+                    if (dist > 32.0f || (bot.stuckT > 80 && dist > 8.0f)) {
+                        b.setPos(owner.getX(), owner.getY(), owner.getZ());
+                        bot.vy = 0;
+                        bot.stuckT = 0;
+                    } else if (dist > 4.0f) {
+                        mv = toward(b, owner.getX(), owner.getZ(), dist > 10.0f ? 0.27 : 0.21);
+                    }
+                }
+            } else if ("guard".equals(bot.mode) && bot.guardPos != null) {
+                double gx = bot.guardPos.x - b.getX();
+                double gz = bot.guardPos.z - b.getZ();
+                if (gx * gx + gz * gz > 25.0) {
+                    mv = toward(b, bot.guardPos.x, bot.guardPos.z, 0.2);
+                }
+            }
+        }
+
+        move(level, bot, mv[0], mv[1]);
+    }
+}
